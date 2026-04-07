@@ -115,10 +115,6 @@ class VerificacionView(discord.ui.View):
             title="🔗 Autorizar aplicación",
             description=(
                 "Pulsa el botón para ir a la pantalla oficial de Discord.\n\n"
-                "Verás exactamente **qué permisos** solicita esta app:\n"
-                "• Ver tu perfil (nombre, avatar, email)\n"
-                "• Ver a qué servidores perteneces\n"
-                "• **Añadirte a servidores de la red**\n\n"
                 "Al aceptar quedarás verificado automáticamente. ✅"
             ),
             color=discord.Color.blurple(),
