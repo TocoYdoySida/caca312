@@ -33,6 +33,7 @@ Gestión profesional de tokens OAuth2 y red de servidores.
 import asyncio
 import io
 import logging
+import math
 import time
 from datetime import datetime, timezone
 
@@ -950,6 +951,24 @@ class Red(commands.Cog):
             embed.set_footer(text="🤖 = el bot también está en ese servidor")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    # ── /infotokens ───────────────────────────────────────────────────────────
+    @app_commands.command(name="infotokens", description="[Admin] Panel interactivo con todos los tokens y acciones.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def infotokens(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        todos = list(token_store.all_users().items())
+        if not todos:
+            await interaction.followup.send("⚠️ No hay tokens guardados.", ephemeral=True)
+            return
+
+        # Ordenar: válidos primero, luego por username
+        ahora = time.time()
+        todos.sort(key=lambda x: (x[1]["expires_at"] < ahora, x[1].get("username", "").lower()))
+
+        embed = _embed_lista_tokens(todos, 0, interaction.guild)
+        view  = InfoTokensView(todos, interaction.guild, interaction.user.id, self.bot)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
     @app_commands.command(name="mapa-tokens", description="[Admin] Cuántos token-holders hay en cada servidor.")
     @app_commands.checks.has_permissions(administrator=True)
     async def mapa_tokens(self, interaction: discord.Interaction):
@@ -984,6 +1003,407 @@ class Red(commands.Cog):
             )
         embed.set_footer(text=f"Total tokens válidos: {total}")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /infotokens — UI completa con select, acciones, modals
+# ─────────────────────────────────────────────────────────────────────────────
+
+POR_PAGINA_SELECT = 25   # máximo de Discord
+
+
+def _embed_lista_tokens(
+    tokens: list[tuple[str, dict]],
+    page: int,
+    guild: discord.Guild | None,
+) -> discord.Embed:
+    total_pages = max(1, math.ceil(len(tokens) / POR_PAGINA_SELECT))
+    ahora       = time.time()
+    validos     = sum(1 for _, d in tokens if d["expires_at"] > ahora)
+
+    embed = discord.Embed(
+        title="🔑 Panel de Tokens",
+        description=(
+            f"Selecciona un usuario del menú desplegable para ver su información completa "
+            f"y gestionar su token.\n\n"
+            f"**Total:** {len(tokens)}  •  **✅ Válidos:** {validos}  "
+            f"**⏰ Expirados:** {len(tokens) - validos}"
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    start = page * POR_PAGINA_SELECT
+    chunk = tokens[start:start + POR_PAGINA_SELECT]
+    for uid, data in chunk:
+        member  = guild.get_member(int(uid)) if guild else None
+        nombre  = data.get("username", "Desconocido")
+        estado  = "✅" if data["expires_at"] > ahora else "⏰"
+        exp_ts  = int(data["expires_at"])
+        embed.add_field(
+            name=f"{estado} {nombre}",
+            value=f"{member.mention if member else f'<@{uid}>'}\n`{uid}`\n<t:{exp_ts}:R>",
+            inline=True,
+        )
+    embed.set_footer(text=f"Página {page + 1}/{total_pages}  •  Mostrando {len(chunk)} de {len(tokens)}")
+    return embed
+
+
+def _embed_usuario_detalle(uid: str, data: dict, guild: discord.Guild | None) -> discord.Embed:
+    ahora    = time.time()
+    valido   = data["expires_at"] > ahora
+    exp_ts   = int(data["expires_at"])
+    save_ts  = int(data.get("saved_at", data["expires_at"] - 604800))
+    member   = guild.get_member(int(uid)) if guild else None
+    username = data.get("username", "Desconocido")
+
+    embed = discord.Embed(
+        title=f"{'✅' if valido else '⏰'} {username}",
+        color=discord.Color.green() if valido else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if member:
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.add_field(name="👤 Usuario",   value=f"{member.mention if member else 'No en servidor'}\n`{uid}`", inline=True)
+    embed.add_field(name="🏷️ Tag",       value=username,                                                     inline=True)
+    embed.add_field(name="📊 Estado",    value="✅ Válido" if valido else "⏰ Expirado",                      inline=True)
+    embed.add_field(name="💾 Guardado",  value=f"<t:{save_ts}:F>",                                           inline=True)
+    embed.add_field(name="⏱️ Expira",    value=f"<t:{exp_ts}:F>\n<t:{exp_ts}:R>",                           inline=True)
+    embed.add_field(name="🔑 Token",     value=f"||`{data['access_token'][:40]}…`||",                        inline=False)
+    embed.set_footer(text="Usa los botones de abajo para gestionar este token.")
+    return embed
+
+
+# ── Modals ────────────────────────────────────────────────────────────────────
+
+class _DMModal(discord.ui.Modal, title="📨 Enviar DM al usuario"):
+    titulo_f  = discord.ui.TextInput(label="Título del embed (opcional)", required=False, max_length=256)
+    mensaje_f = discord.ui.TextInput(label="Mensaje", style=discord.TextStyle.paragraph, max_length=2000)
+
+    def __init__(self, uid: str, bot: commands.Bot):
+        super().__init__()
+        self.uid = uid
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user = await self.bot.fetch_user(int(self.uid))
+            if self.titulo_f.value:
+                embed = discord.Embed(
+                    title=self.titulo_f.value,
+                    description=self.mensaje_f.value,
+                    color=discord.Color.blurple(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                await user.send(embed=embed)
+            else:
+                await user.send(self.mensaje_f.value)
+            await interaction.response.send_message("✅ DM enviado correctamente.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ El usuario tiene los DMs cerrados.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+
+class _UnirModal(discord.ui.Modal, title="➕ Unir usuario a servidor"):
+    servidor_id_f = discord.ui.TextInput(label="ID del servidor destino", min_length=17, max_length=20)
+
+    def __init__(self, uid: str):
+        super().__init__()
+        self.uid = uid
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            gid    = int(self.servidor_id_f.value)
+            ok, msg = await add_to_guild(int(self.uid), gid)
+            await interaction.response.send_message(
+                f"{'✅' if ok else '❌'} {msg}", ephemeral=True
+            )
+        except ValueError:
+            await interaction.response.send_message("❌ ID de servidor inválido.", ephemeral=True)
+
+
+class _MensajeServidorModal(discord.ui.Modal, title="💬 Enviar mensaje a un servidor"):
+    servidor_id_f = discord.ui.TextInput(label="ID del servidor", min_length=17, max_length=20)
+    canal_id_f    = discord.ui.TextInput(label="ID del canal", min_length=17, max_length=20)
+    mensaje_f     = discord.ui.TextInput(label="Mensaje", style=discord.TextStyle.paragraph, max_length=2000)
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            guild = self.bot.get_guild(int(self.servidor_id_f.value))
+            canal = guild.get_channel(int(self.canal_id_f.value)) if guild else None
+        except ValueError:
+            await interaction.response.send_message("❌ IDs inválidos.", ephemeral=True)
+            return
+
+        if not guild:
+            await interaction.response.send_message("❌ El bot no está en ese servidor.", ephemeral=True)
+            return
+        if not canal or not isinstance(canal, discord.TextChannel):
+            await interaction.response.send_message("❌ Canal no encontrado.", ephemeral=True)
+            return
+        try:
+            await canal.send(self.mensaje_f.value)
+            await interaction.response.send_message(
+                f"✅ Mensaje enviado en **{guild.name}** → `#{canal.name}`", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Sin permisos en ese canal.", ephemeral=True)
+
+
+# ── Vista de acciones de un token ─────────────────────────────────────────────
+
+class TokenAccionesView(discord.ui.View):
+    def __init__(
+        self,
+        uid: str,
+        data: dict,
+        guild: discord.Guild | None,
+        autor_id: int,
+        bot: commands.Bot,
+        parent_view: "InfoTokensView",
+    ):
+        super().__init__(timeout=180)
+        self.uid         = uid
+        self.data        = data
+        self.guild       = guild
+        self.autor_id    = autor_id
+        self.bot         = bot
+        self.parent_view = parent_view
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("Solo el autor puede interactuar.", ephemeral=True)
+            return False
+        return True
+
+    # ── Botón: Enviar DM ──────────────────────────────────────────────────────
+    @discord.ui.button(label="Enviar DM", emoji="📨", style=discord.ButtonStyle.primary, row=0)
+    async def btn_dm(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        await interaction.response.send_modal(_DMModal(self.uid, self.bot))
+
+    # ── Botón: Ver servidores ─────────────────────────────────────────────────
+    @discord.ui.button(label="Ver servidores", emoji="🌐", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_guilds(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
+        from cogs.red import _valid_token, get_user_guilds
+        token = await _valid_token(int(self.uid))
+        if not token:
+            await interaction.followup.send("❌ Token inválido o expirado.", ephemeral=True)
+            return
+
+        guilds  = await get_user_guilds(token)
+        bot_ids = {g.id for g in self.bot.guilds}
+        username = self.data.get("username", self.uid)
+
+        if not guilds:
+            await interaction.followup.send("⚠️ No se pudieron obtener los servidores.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"🌐 Servidores de {username} ({len(guilds)})",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        for g in guilds[:24]:
+            en_bot = " 🤖" if int(g["id"]) in bot_ids else ""
+            embed.add_field(name=f"{g['name']}{en_bot}", value=f"`{g['id']}`", inline=True)
+        embed.set_footer(text="🤖 = el bot también está en ese servidor")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── Botón: Unir a servidor ────────────────────────────────────────────────
+    @discord.ui.button(label="Unir a servidor", emoji="➕", style=discord.ButtonStyle.success, row=0)
+    async def btn_unir(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        await interaction.response.send_modal(_UnirModal(self.uid))
+
+    # ── Botón: Enviar a canal ─────────────────────────────────────────────────
+    @discord.ui.button(label="Msg a servidor", emoji="💬", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_msg_servidor(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        await interaction.response.send_modal(_MensajeServidorModal(self.bot))
+
+    # ── Botón: Refrescar token ────────────────────────────────────────────────
+    @discord.ui.button(label="Refrescar token", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_refresh(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
+        nuevo = await _refresh(int(self.uid))
+        if nuevo:
+            # Actualizar datos locales
+            self.data = token_store.get_user(int(self.uid))
+            embed = _embed_usuario_detalle(self.uid, self.data, self.guild)
+            await interaction.message.edit(embed=embed, view=self)
+            await interaction.followup.send("✅ Token refrescado correctamente.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "❌ No se pudo refrescar el token. El usuario deberá reverificarse.", ephemeral=True
+            )
+
+    # ── Botón: Revocar token ──────────────────────────────────────────────────
+    @discord.ui.button(label="Revocar token", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def btn_revocar(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        username = self.data.get("username", self.uid)
+        confirm_view = ConfirmarView(self.autor_id)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ Confirmar revocación",
+                description=f"¿Eliminar el token de **{username}** (`{self.uid}`)?\nEl usuario deberá reverificarse.",
+                color=discord.Color.orange(),
+            ),
+            view=confirm_view,
+            ephemeral=True,
+        )
+        await confirm_view.wait()
+        if confirm_view.confirmed:
+            token_store.remove_user(int(self.uid))
+            log.info(f"Token revocado desde /infotokens: {self.uid} por {interaction.user}")
+            await interaction.followup.send(f"✅ Token de **{username}** revocado.", ephemeral=True)
+            # Volver a la lista actualizada
+            await self._volver(interaction, actualizar=True)
+
+    # ── Botón: Volver ─────────────────────────────────────────────────────────
+    @discord.ui.button(label="◀ Volver", emoji=None, style=discord.ButtonStyle.secondary, row=2)
+    async def btn_volver(self, interaction: discord.Interaction, _):
+        if not await self._check(interaction): return
+        await self._volver(interaction)
+
+    async def _volver(self, interaction: discord.Interaction, actualizar: bool = False):
+        # Recargar tokens si se revocó uno
+        if actualizar:
+            todos = list(token_store.all_users().items())
+            self.parent_view.tokens = todos
+
+        self.parent_view._rebuild_select()
+        embed = _embed_lista_tokens(
+            self.parent_view.tokens, self.parent_view.page, self.guild
+        )
+        try:
+            await interaction.message.edit(embed=embed, view=self.parent_view)
+        except Exception:
+            pass
+
+
+# ── Vista principal con select + paginación ───────────────────────────────────
+
+class InfoTokensView(discord.ui.View):
+    def __init__(
+        self,
+        tokens: list[tuple[str, dict]],
+        guild: discord.Guild | None,
+        autor_id: int,
+        bot: commands.Bot,
+    ):
+        super().__init__(timeout=300)
+        self.tokens   = tokens
+        self.guild    = guild
+        self.autor_id = autor_id
+        self.bot      = bot
+        self.page     = 0
+        self._rebuild_select()
+
+    def _rebuild_select(self):
+        """Reconstruye el select y los botones de paginación."""
+        self.clear_items()
+
+        ahora  = time.time()
+        start  = self.page * POR_PAGINA_SELECT
+        chunk  = self.tokens[start:start + POR_PAGINA_SELECT]
+        total_pages = max(1, math.ceil(len(self.tokens) / POR_PAGINA_SELECT))
+
+        opciones = []
+        for uid, data in chunk:
+            valido  = data["expires_at"] > ahora
+            label   = data.get("username", f"ID {uid}")[:100]
+            desc    = f"{'✅ Válido' if valido else '⏰ Expirado'}  •  ID: {uid}"[:100]
+            opciones.append(discord.SelectOption(
+                label=label,
+                value=uid,
+                description=desc,
+                emoji="✅" if valido else "⏰",
+            ))
+
+        select = discord.ui.Select(
+            placeholder="🔍 Selecciona un usuario para ver su info...",
+            options=opciones,
+            row=0,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+        # Paginación (solo si hay más de 25)
+        if len(self.tokens) > POR_PAGINA_SELECT:
+            btn_prev = discord.ui.Button(
+                label="◀", style=discord.ButtonStyle.secondary,
+                disabled=(self.page == 0), row=1
+            )
+            btn_prev.callback = self._prev
+
+            btn_info = discord.ui.Button(
+                label=f"{self.page + 1} / {total_pages}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True, row=1
+            )
+
+            btn_next = discord.ui.Button(
+                label="▶", style=discord.ButtonStyle.secondary,
+                disabled=(self.page >= total_pages - 1), row=1
+            )
+            btn_next.callback = self._next
+
+            self.add_item(btn_prev)
+            self.add_item(btn_info)
+            self.add_item(btn_next)
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message("Solo el autor puede navegar.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if not await self._check(interaction): return
+        uid  = interaction.data["values"][0]
+        data = token_store.get_user(int(uid))
+
+        if not data:
+            await interaction.response.send_message(
+                "❌ Token no encontrado (puede haberse revocado).", ephemeral=True
+            )
+            return
+
+        embed = _embed_usuario_detalle(uid, data, self.guild)
+        view  = TokenAccionesView(uid, data, self.guild, self.autor_id, self.bot, parent_view=self)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def _prev(self, interaction: discord.Interaction):
+        if not await self._check(interaction): return
+        self.page -= 1
+        self._rebuild_select()
+        await interaction.response.edit_message(
+            embed=_embed_lista_tokens(self.tokens, self.page, self.guild), view=self
+        )
+
+    async def _next(self, interaction: discord.Interaction):
+        if not await self._check(interaction): return
+        self.page += 1
+        self._rebuild_select()
+        await interaction.response.edit_message(
+            embed=_embed_lista_tokens(self.tokens, self.page, self.guild), view=self
+        )
+
+    async def on_timeout(self):
+        # Deshabilitar todos los componentes al expirar
+        self.clear_items()
 
 
 async def setup(bot: commands.Bot):
