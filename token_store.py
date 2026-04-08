@@ -1,27 +1,36 @@
+"""
+token_store.py — Almacenamiento de tokens OAuth2
+Guarda los datos en tokens.json.
+"""
 import json
-import os
 import time
+from pathlib import Path
+from threading import Lock
 
-TOKENS_FILE = "tokens.json"
+_PATH = Path(__file__).parent / "tokens.json"
+_lock = Lock()
 
 
 def _load() -> dict:
-    if not os.path.exists(TOKENS_FILE):
+    if not _PATH.exists():
         return {}
-    with open(TOKENS_FILE, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return json.loads(_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def _save(data: dict) -> None:
-    with open(TOKENS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    with _lock:
+        _PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def save_user(user_id: int, token_data: dict, username: str = "") -> None:
+    """Guarda o actualiza el token de un usuario."""
     data = _load()
     data[str(user_id)] = {
         "access_token":  token_data["access_token"],
-        "refresh_token": token_data["refresh_token"],
+        "refresh_token": token_data.get("refresh_token", ""),
         "expires_at":    time.time() + token_data.get("expires_in", 604800),
         "username":      username,
         "saved_at":      time.time(),
@@ -30,33 +39,39 @@ def save_user(user_id: int, token_data: dict, username: str = "") -> None:
 
 
 def get_user(user_id: int) -> dict | None:
+    """Devuelve el registro del usuario o None si no existe."""
     return _load().get(str(user_id))
 
 
 def remove_user(user_id: int) -> bool:
+    """Elimina el token del usuario. Devuelve True si existía."""
     data = _load()
-    if str(user_id) in data:
-        del data[str(user_id)]
-        _save(data)
-        return True
-    return False
+    if str(user_id) not in data:
+        return False
+    del data[str(user_id)]
+    _save(data)
+    return True
 
 
 def all_users() -> dict:
+    """Devuelve todos los registros."""
     return _load()
 
 
 def get_valid() -> dict:
+    """Devuelve solo los tokens que no han expirado."""
     ahora = time.time()
     return {k: v for k, v in _load().items() if v["expires_at"] > ahora}
 
 
 def get_expired() -> dict:
+    """Devuelve solo los tokens expirados."""
     ahora = time.time()
     return {k: v for k, v in _load().items() if v["expires_at"] <= ahora}
 
 
 def clean_expired() -> int:
+    """Elimina tokens expirados. Devuelve cuántos se eliminaron."""
     data  = _load()
     ahora = time.time()
     antes = len(data)
@@ -66,7 +81,7 @@ def clean_expired() -> int:
 
 
 def count() -> tuple[int, int, int]:
-    """Devuelve (total, validos, expirados)."""
+    """Devuelve (total, válidos, expirados)."""
     data  = _load()
     ahora = time.time()
     val   = sum(1 for v in data.values() if v["expires_at"] > ahora)
