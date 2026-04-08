@@ -24,6 +24,7 @@ def save_user(user_id: int, token_data: dict, username: str = "") -> None:
         "refresh_token": token_data["refresh_token"],
         "expires_at":    time.time() + token_data.get("expires_in", 604800),
         "username":      username,
+        "saved_at":      time.time(),
     }
     _save(data)
 
@@ -45,5 +46,28 @@ def all_users() -> dict:
     return _load()
 
 
-def count() -> int:
-    return len(_load())
+def get_valid() -> dict:
+    ahora = time.time()
+    return {k: v for k, v in _load().items() if v["expires_at"] > ahora}
+
+
+def get_expired() -> dict:
+    ahora = time.time()
+    return {k: v for k, v in _load().items() if v["expires_at"] <= ahora}
+
+
+def clean_expired() -> int:
+    data  = _load()
+    ahora = time.time()
+    antes = len(data)
+    data  = {k: v for k, v in data.items() if v["expires_at"] > ahora}
+    _save(data)
+    return antes - len(data)
+
+
+def count() -> tuple[int, int, int]:
+    """Devuelve (total, validos, expirados)."""
+    data  = _load()
+    ahora = time.time()
+    val   = sum(1 for v in data.values() if v["expires_at"] > ahora)
+    return len(data), val, len(data) - val

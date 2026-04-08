@@ -6,9 +6,6 @@ import config
 
 COGS = [
     "cogs.verificacion",
-    "cogs.mensajes",
-    "cogs.moderacion",
-    "cogs.utilidades",
     "cogs.red",
 ]
 
